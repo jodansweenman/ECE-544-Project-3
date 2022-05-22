@@ -24,7 +24,6 @@
 #include "semphr.h"
 
 /* BSP includes. */
-#include "xintc.h"
 #include "xtmrctr.h"
 #include "xgpio.h"
 #include "sleep.h"
@@ -32,6 +31,7 @@
 #include "PmodOLEDrgb.h"
 #include "PmodENC544.h"
 #include "xwdttb.h"
+#include "platform.h"
 
 #define mainQUEUE_LENGTH					( 1 )
 
@@ -68,29 +68,22 @@
 // Watchdog definitions
 #define WDTTB_DEVICE_ID		XPAR_WDTTB_0_DEVICE_ID
 #define INTC_DEVICE_ID		XPAR_INTC_0_DEVICE_ID
-#define WDTTB_IRPT_INTR		XPAR_INTC_0_WDTTB_0_VEC_ID
-
-#define INTC		XIntc
-#define INTC_HANDLER	XIntc_InterruptHandler
+#define WDTTB_IRPT_INTR		XPAR_INTC_0_WDTTB_0_WDT_INTERRUPT_VEC_ID
 
 // Definitions for Switch Masks
 #define K_SWITCH_MASK           0x000Cu
 #define INCREMENT_MASK          0x0030u
 #define SETPOINT_MASK           0x0003u
+#define SW_15_MASK				0x8000u
 
 // Maximum RPM Definitions
 #define MAX_RPM					3000
 
 //Create Instances
 static XGpio xOutputGPIOInstance, xInputGPIOInstance;
-XWdtTb WdtTbInstance;            /* Instance of Time Base WatchDog Timer */
-INTC IntcInstance;              /* Instance of the Interrupt Controller */
+XWdtTb WDTInst;
 PmodOLEDrgb	pmodOLEDrgb_inst;
 
-static volatile int WdtExpired;
-
-//Function Declarations
-static void prvSetupHardware( void );
 
 //Declare a Semaphore
 xSemaphoreHandle binary_sem;
@@ -107,33 +100,24 @@ volatile uint32_t OLD_ROTENC_CNT = 0;
 
 volatile uint16_t leds = 0;
 
-int counter = 0;
+volatile uint16_t wdt_switch = 0;
+volatile uint8_t  sys_flag = 1;
 
-/************************** Function Prototypes ******************************/
-
-int WdtTbIntrExample(INTC *IntcInstancePtr,
-			XWdtTb *WdtTbInstancePtr,
-			u16 WdtTbDeviceId,
-			u16 WdtTbIntrId);
-
-static void WdtTbIntrHandler(void *CallBackRef);
-
-static int WdtTbSetupIntrSystem(INTC *IntcInstancePtr,
-				XWdtTb *WdtTbInstancePtr,
-				u16 WdtTbIntrId);
-
-static void WdtTbDisableIntrSystem(INTC *IntcInstancePtr,
-				u16 WdtTbIntrId);
+//Function Declarations
+static void prvSetupHardware( void );
 void PMDIO_itoa(int32_t value, char *string, int32_t radix);
 void PMDIO_putnum(PmodOLEDrgb* InstancePtr, int32_t num, int32_t radix);
 void Update_Seven_Seg(uint16_t DesiredRPM);
 void Reset_Seven_Seg();
+void master_thread ();
+void parameter_input_thread (void *p);
+void display_thread (void *p);
+void PID_thread (void *p);
 
 //ISR, to handle interrupt of GPIO dip switch
 //Can also use Push buttons.
 //Give a Semaphore
-static void gpio_intr (void *pvUnused)
-{
+static void gpio_intr (void *pvUnused) {
 	//xSemaphoreGiveFromISR(binary_sem,NULL);
 	pressed = 1;
 
@@ -145,19 +129,60 @@ static void gpio_intr (void *pvUnused)
 
 }
 
-static void WdtTbIntrHandler(void *CallBackRef)
+void wdt_handler(void *pvUnused) {
+    //if system running flag is set, restart the watch dog timer
+	leds = (leds & 0xFFFF) | 0x8000;
+	XGpio_DiscreteWrite( &xOutputGPIOInstance, 1, leds );
+	usleep(10000);
+	leds = (leds & 0x0FFF);
+	XGpio_DiscreteWrite( &xOutputGPIOInstance, 1, leds );
+    if(sys_flag == 1)
+    {
+        XWdtTb_RestartWdt(&WDTInst);
+        sys_flag = 0;
+    }
+}
+
+void master_thread ()
 {
-	XWdtTb *WdtTbInstancePtr = (XWdtTb *)CallBackRef;
+	//Create Semaphore
+	//vSemaphoreCreateBinary(binary_sem);
 
-	/*
-	 * Set the flag indicating that the WDT has expired
-	 */
-	WdtExpired = TRUE;
+	/* Create the queue */
+	xQueueKParams = xQueueCreate( mainQUEUE_LENGTH, sizeof( unsigned long ) );
+	xQueueDesSpdDir = xQueueCreate( mainQUEUE_LENGTH, sizeof( unsigned long ) );
 
-	/*
-	 * Restart the watchdog timer as a normal application would
-	 */
-	XWdtTb_RestartWdt(WdtTbInstancePtr);
+	/* Sanity check that the queue was created. */
+	configASSERT( xQueueKParams );
+	configASSERT( xQueueDesSpdDir );
+
+	//Create Task1
+	xTaskCreate( parameter_input_thread,
+				 ( const char * ) "TX",
+				 2048,
+				 NULL,
+				 1,
+				 NULL );
+
+	//Create Task2
+	xTaskCreate( display_thread,
+				"RX",
+				2048,
+				NULL,
+				2,
+				NULL );
+
+	//Start the Scheduler
+	xil_printf("Starting the scheduler\r\n");
+	vTaskStartScheduler();
+
+	//while(1)
+	//	if(wdt_switch == 1){
+	//		sys_flag = 0;
+	//	}
+	//	else {
+	//		sys_flag = 1;
+	//	}
 }
 
 //A task which takes the Interrupt Semaphore and sends a queue to task 2.
@@ -176,6 +201,13 @@ void parameter_input_thread (void *p)
 		uiIncrementSw = (switches & INCREMENT_MASK)>>4;
 		uiKParamSwitch = (switches & K_SWITCH_MASK)>>2;
 		uiSetPointSwitch = (switches & SETPOINT_MASK);
+		wdt_switch = (switches &SW_15_MASK)>>15;
+		if(wdt_switch == 1){
+			sys_flag = 0;
+		}
+		else{
+			sys_flag = 1;
+		}
 		xil_printf("Increment: %d\r\n",uiIncrementSw);
 		xil_printf("K: %d\r\n",uiKParamSwitch);
 		xil_printf("SetPoint: %d\r\n",uiSetPointSwitch);
@@ -281,6 +313,13 @@ void parameter_input_thread (void *p)
 	    	xQueueSend( xQueueKParams, &ulKParamsToSend, mainDONT_BLOCK );
 	    	xQueueSend( xQueueDesSpdDir, &ulDesDirSpdToSend, mainDONT_BLOCK );
 	    	OLD_ROTENC_CNT = ROTENC_CNT;
+
+	    }
+	    if(wdt_switch == 1){
+	    	sys_flag = 0;
+	    }
+	    else{
+	    	sys_flag = 1;
 	    }
 	}
 	//Could use to take rotary encoder values (A trick, coz pmodENC dosen't support interrupt.)
@@ -293,9 +332,8 @@ void display_thread (void *p)
 		xQueueReceive( xQueueKParams, &ulKParamsReceived, portMAX_DELAY );
 		xQueueReceive( xQueueDesSpdDir, &ulDesSpdDirReceived, portMAX_DELAY );
 		//Write to LED.
-		//XGpio_DiscreteWrite( &xOutputGPIOInstance, 1, ulReceivedValue );
 		xil_printf("Queue Received: %d\r\n",ulKParamsReceived);
-		xil_printf("Queue Received: %d\r\n",ulDesSpdDirReceived);
+		xil_printf("Queue 2 Received: %d\r\n",ulDesSpdDirReceived);
 		//Write to OLED.
 		OLEDrgb_SetFontColor(&pmodOLEDrgb_inst,OLEDrgb_BuildRGB(200, 12, 44));
 		OLEDrgb_Clear(&pmodOLEDrgb_inst);
@@ -322,173 +360,35 @@ void display_thread (void *p)
 	}
 }
 
-int WdtTbIntrExample(INTC *IntcInstancePtr,
-			XWdtTb *WdtTbInstancePtr,
-			u16 WdtTbDeviceId,
-			u16 WdtTbIntrId)
-{
-	int Status;
-	XWdtTb_Config *Config;
-
-	/*
-	 * Initialize the WDTTB driver so that it's ready to use look up
-	 * configuration in the config table, then initialize it.
-	 */
-	Config = XWdtTb_LookupConfig(WdtTbDeviceId);
-	if (NULL == Config) {
-		return XST_FAILURE;
-	}
-
-	/*
-	 * Initialize the watchdog timer and timebase driver so that
-	 * it is ready to use.
-	 */
-	Status = XWdtTb_CfgInitialize(WdtTbInstancePtr, Config,
-			Config->BaseAddr);
-	if (Status != XST_SUCCESS) {
-		return XST_FAILURE;
-	}
-
-	/*
-	 * Perform a self-test to ensure that the hardware was built correctly
-	 */
-	Status = XWdtTb_SelfTest(WdtTbInstancePtr);
-	if (Status != XST_SUCCESS) {
-		return XST_FAILURE;
-	}
-
-	/*
-	 * Stop the timer to start the test for interrupt mode
-	 */
-	XWdtTb_Stop(WdtTbInstancePtr);
-
-	/*
-	 * Connect the WdtTb to the interrupt subsystem so that interrupts
-	 * can occur
-	 */
-	Status = WdtTbSetupIntrSystem(IntcInstancePtr,
-					WdtTbInstancePtr,
-					WdtTbIntrId);
-	if (Status != XST_SUCCESS) {
-		return XST_FAILURE;
-	}
-
-	/*
-	 * Start the WdtTb device
-	 */
-	WdtExpired = FALSE;
-	XWdtTb_Start(WdtTbInstancePtr);
-
-	/*
-	 * Wait for the first expiration of the WDT
-	 */
-	while (WdtExpired != TRUE);
-	WdtExpired = FALSE;
-
-	/*
-	 * Wait for the second expiration of the WDT
-	 */
-	while (WdtExpired != TRUE);
-	WdtExpired = FALSE;
-
-	/*
-	 * Check whether the WatchDog Reset Status has been set.
-	 * If this is set means then the test has failed
-	 */
-	if (XWdtTb_ReadReg(WdtTbInstancePtr->Config.BaseAddr,
-			XWT_TWCSR0_OFFSET) & XWT_CSR0_WRS_MASK) {
-		/*
-		 * Disable and disconnect the interrupt system
-		 */
-		WdtTbDisableIntrSystem(IntcInstancePtr, WdtTbIntrId);
-
-		/*
-		 * Stop the timer
-		 */
-		XWdtTb_Stop(WdtTbInstancePtr);
-
-		return XST_FAILURE;
-	}
-
-	/*
-	 * Disable and disconnect the interrupt system
-	 */
-	WdtTbDisableIntrSystem(IntcInstancePtr, WdtTbIntrId);
-
-	/*
-	 * Stop the timer
-	 */
-	XWdtTb_Stop(WdtTbInstancePtr);
-
-	return XST_SUCCESS;
-}
-
 int main(void)
 {
-
+	uint16_t sw = 0;
 
 	// Announcement
-	xil_printf("Hello from FreeRTOS Example\r\n");
+	xil_printf("ECE 544 Project 3\r\n");
 
-	int Status;
-
-	/*
-	 * Call the WdtTb interrupt example, specify the parameters generated in
-	 * xparameters.h
-	 */
-	Status = WdtTbIntrExample(&IntcInstance,
-				&WdtTbInstance,
-				WDTTB_DEVICE_ID,
-				WDTTB_IRPT_INTR);
-	if (Status != XST_SUCCESS) {
-		xil_printf("WDTTB interrupt example failed.\n\r");
-		return XST_FAILURE;
-	}
-
-	xil_printf("Successfully ran WDTTB interrupt example\n\r");
-
-	//return XST_SUCCESS;
+	init_platform();
 
 	//Initialize the HW
 	prvSetupHardware();
 
+	 if (XWdtTb_IsWdtExpired(&WDTInst)) {
+		 // instead of having a print, the user will know that the
+	     // WDT triggered a reset if the Seven Segment display still
+	     // displays "ECE 544"
+		 do
+		 {
+			 sw = NX4IO_getSwitches() & SW_15_MASK;
+		 }while(sw);
+	 }
+
 	Reset_Seven_Seg();
 
-	//Create Semaphore
-	vSemaphoreCreateBinary(binary_sem);
+	master_thread();
 
-	/* Create the queue */
-	xQueueKParams = xQueueCreate( mainQUEUE_LENGTH, sizeof( unsigned long ) );
-	xQueueDesSpdDir = xQueueCreate( mainQUEUE_LENGTH, sizeof( unsigned long ) );
-
-	/* Sanity check that the queue was created. */
-	configASSERT( xQueueKParams );
-	configASSERT( xQueueDesSpdDir );
-
-	//Create Task1
-	xTaskCreate( parameter_input_thread,
-				 ( const char * ) "TX",
-				 2048,
-				 NULL,
-				 1,
-				 NULL );
-
-	//Create Task2
-	xTaskCreate( display_thread,
-				"RX",
-				2048,
-				NULL,
-				2,
-				NULL );
-
-
-
-	//Start the Scheduler
-	xil_printf("Starting the scheduler\r\n");
-	xil_printf("Flip one of the switches to change the LED pattern\r\n\r\n");
-	vTaskStartScheduler();
-
-	return -1;
+	// cleanup and exit
+	cleanup_platform();
+	exit(0);
 }
 
 
@@ -499,26 +399,51 @@ uint32_t status;
 const unsigned char ucSetToOutput = 0U;
 const unsigned char ucSetToInput = 0xFFU;
 
+	/* Initialize watchdog timer */
+	xil_printf("Initializing watchdog timer\r\n");
+	xStatus = XWdtTb_Initialize(&WDTInst, XPAR_AXI_TIMEBASE_WDT_0_DEVICE_ID);
+	if (xStatus == XST_FAILURE) {
+		xil_printf("Failed to initialize watchdog timer\r\n");
+	}
+	if( xStatus == XST_SUCCESS ) {
+		xStatus = xPortInstallInterruptHandler( XPAR_MICROBLAZE_0_AXI_INTC_AXI_TIMEBASE_WDT_0_WDT_INTERRUPT_INTR, wdt_handler, NULL );
+
+		if(xStatus == pdPASS) {
+			xil_printf("Watchdog Timer interrupt handler installed\r\n");
+
+			vPortEnableInterrupt( XPAR_MICROBLAZE_0_AXI_INTC_AXI_TIMEBASE_WDT_0_WDT_INTERRUPT_INTR );
+
+			XWdtTb_Start(&WDTInst);
+		}
+	}
+
+
+	/* Initialize the Nexys4IO. */
 	xil_printf("Initializing GPIO's\r\n");
-
-	/* Initialize the GPIO for the LEDs. */
-
 	status = (uint32_t) NX4IO_initialize(NX4IO_BASEADDR);
+	if (status != XST_SUCCESS){
+		return XST_FAILURE;
+	}
 
 	NX4IO_SSEG_setSSEG_DATA(SSEGHI, 0x0058E30E);
 	NX4IO_SSEG_setSSEG_DATA(SSEGLO, 0x00144116);
 
+	/* Initialize the PMOD Encoder. */
 	xStatus = PMODENC544_initialize(PMODENC_BASEADDR);
-	OLEDrgb_begin(&pmodOLEDrgb_inst, RGBDSPLY_GPIO_BASEADDR, RGBDSPLY_SPI_BASEADDR);
-	xStatus = XGpio_Initialize( &xOutputGPIOInstance, XPAR_AXI_GPIO_0_DEVICE_ID );
+	if (xStatus != XST_SUCCESS){
+		return XST_FAILURE;
+	}
 
+	/* Initialize the PMOD OLED rgb. */
+	OLEDrgb_begin(&pmodOLEDrgb_inst, RGBDSPLY_GPIO_BASEADDR, RGBDSPLY_SPI_BASEADDR);
+
+	/* Initialize the GPIO for the LEDs. */
+	xStatus = XGpio_Initialize( &xOutputGPIOInstance, XPAR_AXI_GPIO_0_DEVICE_ID );
 	if( xStatus == XST_SUCCESS )
 	{
 		/* All bits on this channel are going to be outputs (LEDs). */
 		XGpio_SetDataDirection( &xOutputGPIOInstance, 1, ucSetToOutput );
-
 		xil_printf("Check that LEDs work\r\n");
-
 		XGpio_DiscreteWrite( &xOutputGPIOInstance, 1, 0x5555 );
 		usleep(10000);
 		XGpio_DiscreteWrite( &xOutputGPIOInstance, 1, 0xAAAA );
@@ -526,13 +451,13 @@ const unsigned char ucSetToInput = 0xFFU;
 
 	}
 
-	/* Initialise the GPIO for the button inputs. */
+	/* Initialize the GPIO for the button and switch inputs. */
 	if( xStatus == XST_SUCCESS )
 	{
 		xStatus = XGpio_Initialize( &xInputGPIOInstance, XPAR_AXI_GPIO_1_DEVICE_ID );
 	}
 
-
+	/* Install the interrupt for the GPIO Switches and Buttons */
 	if( xStatus == XST_SUCCESS )
 	{
 		/* Install the handler defined in this task for the button input.
@@ -663,133 +588,5 @@ void Update_Seven_Seg(uint16_t DesiredRPM)
 	NX4IO_SSEG_setDigit(SSEGLO,DIGIT1,((DesiredRPM/10)%10));
 	NX4IO_SSEG_setDigit(SSEGLO,DIGIT0,(DesiredRPM%10));
 	usleep(5000);
-}
-
-static int WdtTbSetupIntrSystem(INTC *IntcInstancePtr,
-				XWdtTb *WdtTbInstancePtr,
-				u16 WdtTbIntrId)
-{
-	int Status;
-#ifdef XPAR_INTC_0_DEVICE_ID
-#ifndef TESTAPP_GEN
-	/*
-	 * Initialize the interrupt controller driver so that
-	 * it's ready to use. Specify the device ID that is generated in
-	 * xparameters.h
-	 */
-	Status = XIntc_Initialize(IntcInstancePtr, INTC_DEVICE_ID);
-	if(Status != XST_SUCCESS) {
-		return XST_FAILURE;
-	}
-#endif /* TESTAPP_GEN */
-
-	/*
-	 * Connect a device driver handler that will be called when the WDT
-	 * interrupt for the device occurs, the device driver handler performs
-	 * the specific interrupt processing for the device
-	 */
-	Status = XIntc_Connect(IntcInstancePtr, WdtTbIntrId,
-			   (XInterruptHandler)WdtTbIntrHandler,
-			   (void *)WdtTbInstancePtr);
-	if(Status != XST_SUCCESS) {
-		return XST_FAILURE;
-	}
-
-#ifndef TESTAPP_GEN
-	/*
-	 * Start the interrupt controller such that interrupts are enabled for
-	 * all devices that cause interrupts
-	 */
-	Status = XIntc_Start(IntcInstancePtr, XIN_REAL_MODE);
-	if(Status != XST_SUCCESS) {
-		return XST_FAILURE;
-	}
-#endif /* TESTAPP_GEN */
-
-	/*
-	 * Enable the WDT interrupt of the WdtTb Device
-	 */
-	XIntc_Enable(IntcInstancePtr, WdtTbIntrId);
-
-#else
-
-#ifndef TESTAPP_GEN
-	XScuGic_Config *IntcConfig;
-
-	/*
-	 * Initialize the interrupt controller driver so that it is ready to
-	 * use.
-	 */
-	IntcConfig = XScuGic_LookupConfig(INTC_DEVICE_ID);
-	if (NULL == IntcConfig) {
-		return XST_FAILURE;
-	}
-
-	Status = XScuGic_CfgInitialize(IntcInstancePtr, IntcConfig,
-					IntcConfig->CpuBaseAddress);
-	if (Status != XST_SUCCESS) {
-		return XST_FAILURE;
-	}
-#endif /* TESTAPP_GEN */
-
-	XScuGic_SetPriorityTriggerType(IntcInstancePtr, WdtTbIntrId,
-					0xA0, 0x3);
-
-	/*
-	 * Connect the interrupt handler that will be called when an
-	 * interrupt occurs for the device.
-	 */
-	Status = XScuGic_Connect(IntcInstancePtr, WdtTbIntrId,
-				 (Xil_ExceptionHandler)WdtTbIntrHandler,
-				 WdtTbInstancePtr);
-	if (Status != XST_SUCCESS) {
-		return Status;
-	}
-
-	/*
-	 * Enable the interrupt for the Timer device.
-	 */
-	XScuGic_Enable(IntcInstancePtr, WdtTbIntrId);
-#endif /* XPAR_INTC_0_DEVICE_ID */
-
-
-#ifndef TESTAPP_GEN
-	/*
-	 * Initialize the  exception table
-	 */
-	Xil_ExceptionInit();
-
-	/*
-	 * Register the interrupt controller handler with the exception table
-	 */
-	Xil_ExceptionRegisterHandler(XIL_EXCEPTION_ID_INT,
-			 (Xil_ExceptionHandler)INTC_HANDLER,
-			 IntcInstancePtr);
-
-	/*
-	 * Enable non-critical exceptions
-	 */
-	Xil_ExceptionEnable();
-
-#endif /* TESTAPP_GEN */
-
-	return XST_SUCCESS;
-}
-
-static void WdtTbDisableIntrSystem(INTC *IntcInstancePtr, u16 WdtTbIntrId)
-{
-
-	/*
-	 * Disconnect and disable the interrupt for the WdtTb
-	 */
-#ifdef XPAR_INTC_0_DEVICE_ID
-	XIntc_Disconnect(IntcInstancePtr, WdtTbIntrId);
-#else
-	/* Disconnect the interrupt */
-	XScuGic_Disable(IntcInstancePtr, WdtTbIntrId);
-	XScuGic_Disconnect(IntcInstancePtr, WdtTbIntrId);
-
-#endif
-
 }
 
